@@ -116,7 +116,7 @@ function check_prereqs() {
 	fi
 }
 
-function runsetup() {
+function setupandrun() {
     # if REMOTE_HOSTS is not set then no hosts have been specified to run the test on so we will request them from Amazon
     if [ -z "$REMOTE_HOSTS" ] ; then
         
@@ -146,19 +146,85 @@ function runsetup() {
         echo "   -------------------------------------------------------------------------------------"
         echo
         echo
-              
-        # create the instance(s) and capture the instance id(s)
-        echo -n "requesting $instance_count instance(s)..."
-        attempted_instanceids=(`ec2-run-instances \
-		            --key $AMAZON_KEYPAIR_NAME \
-                    -t $INSTANCE_TYPE \
-                    -g $INSTANCE_SECURITYGROUP \
-                    -n 1-$instance_count \
-		            --region $REGION \
-                    --availability-zone \
-                    $INSTANCE_AVAILABILITYZONE $AMI_ID \
-                    | awk '/^INSTANCE/ {print $2}'`)
-        
+             
+
+	if [ -z "$PRICE" ] ; then 
+	    echo "No Price specified. Using on-demand instances..."
+	    # create the instance(s) and capture the instance id(s)
+	    echo -n "requesting $instance_count instance(s)..."
+	    attempted_instanceids=(`ec2-run-instances \
+				--key $AMAZON_KEYPAIR_NAME \
+			-t $INSTANCE_TYPE \
+			-g $INSTANCE_SECURITYGROUP \
+			-n 1-$instance_count \
+				--region $REGION \
+			--availability-zone \
+			$INSTANCE_AVAILABILITYZONE $AMI_ID \
+			| awk '/^INSTANCE/ {print $2}'`)
+        else
+	    echo "Using Spot instances..."
+	    # create the spot instance request(s) and capture the request id(s)
+	    echo -n "requesting $instance_count instance(s)..."
+	    spot_instance_request_id=(`ec2-request-spot-instances -p $PRICE \
+		    --key $AMAZON_KEYPAIR_NAME \
+		    -t $INSTANCE_TYPE \
+		    -g $INSTANCE_SECURITYGROUP \
+		    -n $instance_count \
+		    --region $REGION \
+		    --type one-time \
+		    --user-data "#!/bin/bash 
+			    if [ ! -d $REMOTE_HOME ] ; then
+				mkdir -p $REMOTE_HOME && chown $USER $REMOTE_HOME
+			    fi" \
+		    --availability-zone $INSTANCE_AVAILABILITYZONE $AMI_ID \
+		    | awk '/^SPOTINSTANCEREQUEST/ {print $2}'`)
+	    echo "Spot Instance request submitted, number of requests is: ${#spot_instance_request_id[@]}"
+
+	    echo -n "Spot Instance Request IDs:"
+	    for x in "${spot_instance_request_id[@]}" ; do
+		echo -n " $x"
+	    done
+	    echo "."
+
+
+	    # check status of Spot Instance Request
+	    status_check_count=0
+	    status_check_limit=60
+	    
+	    #spot_request_statuses=(`ec2-describe-spot-instance-requests ${spot_instance_request_id[@]} | awk '/^SPOTINSTANCESTATUS/ {print $2}'`)
+	    spot_request_fulfilled_count=$(echo ${spot_request_status[@]} | tr ' ' '\n' | grep -c fulfilled)
+	    while [ "$spot_request_fulfilled_count" -ne "$instance_count" ] && [ $status_check_count -lt $status_check_limit ]
+	    do	
+		#if [ $spot_request_status == "bad-parameters" ] ; then
+		    #echo "Error: Spot request will not be fulfilled: $spot_request_statuses"
+		    #exit
+		#fi
+		spot_request_statuses=(`ec2-describe-spot-instance-requests ${spot_instance_request_id[@]} | awk '/^SPOTINSTANCESTATUS/ {print $2}'`)
+		spot_request_fulfilled_count=$(echo ${spot_request_statuses[@]} | tr ' ' '\n' | grep -c fulfilled)
+		echo -n "Waiting for spot instance request to fulfill. Fulfilled count is $spot_request_fulfilled_count. "
+		echo -n "Current Spot Instance Request Statuses:"
+		for x in "${spot_request_statuses[@]}" ; do
+		    echo -n " $x"
+		    #TODO: Include Error handling for bad states. Otherwise, if all requests fail, the loop continues until the status_check_limit
+		    # is reached, which could be a while!
+		done
+		echo "."
+
+	    
+		status_check_count=$(( $status_check_count + 1))
+		sleep 5
+	    done
+
+	    # create a filter for the ex2-describe-instance command, to get the instances associated with the spot requests
+	    spot_id_filter=""
+	    for x in "${spot_instance_request_id[@]}" ; do
+		spot_id_filter="$spot_id_filter -filter \"spot-instance-request-id=$x\""
+	    done
+	    echo "Will be using this Spot ID filter to find new instances: $spot_id_filter"	
+	    attempted_instanceids=(`ec2-describe-instances $spot_id_filter | awk '/^INSTANCE/ {print $2}'`)
+    	fi 
+
+
         # check to see if Amazon returned the desired number of instances as a limit is placed restricting this and we need to handle the case where
         # less than the expected number is given wthout failing the test.
         countof_instanceids=${#attempted_instanceids[@]}
@@ -279,7 +345,7 @@ function runsetup() {
         fi
         
         # Tell install.sh to attempt to install JAVA
-        attemptjavainstall=1
+        attemptjavainstall=0 #The Amazon Linux AMI has OpenJDK 1.6.0_24 already installed
     else # the property REMOTE_HOSTS is set so we wil use this list of predefined hosts instead
         hosts=(`echo $REMOTE_HOSTS | tr "," "\n" | tr -d ' '`)
         instance_count=${#hosts[@]}
@@ -309,13 +375,14 @@ function runsetup() {
 	
     # scp install.sh
     if [ "$setup" = "TRUE" ] ; then
-    	echo -n "copying install.sh to $instance_count server(s)..."
+    	echo "copying install.sh to $instance_count server(s)..."
 	    for host in ${hosts[@]} ; do
+		echo "   Host: $host"
 	        (scp -q -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
 	                                      -i $PEM_PATH/$PEM_FILE \
 	                                      $LOCAL_HOME/install.sh \
 					      $LOCAL_HOME/jmeter-ec2.properties \
-	                                      $USER@$host:$REMOTE_HOME \
+	                                      $USER@$host:/tmp/ \
 	                                      && echo "done" > $LOCAL_HOME/$project/$DATETIME-$host-scpinstall.out)
 	    done
 
@@ -334,6 +401,7 @@ function runsetup() {
 	    # Install test software
 	    echo "running install.sh on $instance_count server(s)..."
 	    for host in ${hosts[@]} ; do
+		echo "   Host: $host"
 	        (ssh -nq -o StrictHostKeyChecking=no \
 	            -i $PEM_PATH/$PEM_FILE $USER@$host \
 	            "$REMOTE_HOME/install.sh $REMOTE_HOME $attemptjavainstall $JMETER_VERSION"\
@@ -351,161 +419,177 @@ function runsetup() {
 	    echo "complete"
 	    echo
     fi
-    
-    # Create a working jmx file and edit it to adjust thread counts and filepaths (leave the original jmx intact!)
-    cp $LOCAL_HOME/$project/jmx/$project.jmx $LOCAL_HOME/$project/working
-    working_jmx="$LOCAL_HOME/$project/working"
-    temp_jmx="$LOCAL_HOME/$project/temp"
-    
-    # first filepaths (this will help with things like csv files)
-    # edit any 'stringProp filename=' references to use $REMOTE_DIR in place of whatever local path was being used
-    # we assume that the required dat file is copied into the local /data directory
-    filepaths=$(awk 'BEGIN { FS = ">" } ; /<stringProp name=\"filename\">[^<]*<\/stringProp>/ {print $2}' $working_jmx | cut -d'<' -f1) # pull out filepath
-    i=1
-    while read filepath ; do
-        if [ -n "$filepath" ] ; then # this entry is not blank
-            # extract the filename from the filepath using '/' separator
-            filename=$( echo $filepath | awk -F"/" '{print $NF}' )
-            endresult="$REMOTE_HOME"/data/"$filename"
-            if [[ $filepath =~ .*\$.* ]] ; then
-                echo "The path $filepath contains a $ char, this currently fails the awk sub command."
-                echo "You'll have to remove these from all filepaths. Sorry."
-                echo
-                echo "Script exiting"
-                exit
-            fi
-            awk '/<stringProp name=\"filename\">[^<]*<\/stringProp>/{c++;if(c=='"$i"') \
-                                   {sub("filename\">'"$filepath"'<","filename\">'"$endresult"'<")}}1'  \
-                                   $working_jmx > $temp_jmx
-            rm $working_jmx
-            mv $temp_jmx $working_jmx
-        fi
-        # increment i
-        i=$((i+1))
-    done <<<"$filepaths"
-    
-    # now we use the same working file to edit thread counts
-    # to cope with the problem of trying to spread 10 threads over 3 hosts (10/3 has a remainder) the script creates a unique jmx for each host
-    # and then passes out threads to them on a round robin basis
-    # as part of this we begin here by creating a working jmx file for each separate host using _$y to isolate
-    for y in "${!hosts[@]}" ; do
-        # for each host create a working copy of the jmx file
-        cp "$working_jmx" "$working_jmx"_"$y"   
-    done
-    # loop through each threadgroup and then use a nested loop within that to edit the file for each host
-       # pull out the current values for each thread group
-       threadgroup_threadcounts=(`awk 'BEGIN { FS = ">" } ; /ThreadGroup\.num_threads\">[^<]*</ {print $2}' $working_jmx | cut -d'<' -f1`) # put the current thread counts into variable
-       threadgroup_names=(`awk 'BEGIN { FS = "\"" } ; /ThreadGroup\" testname=\"[^\"]*\"/ {print $6}' $working_jmx`) # capture each thread group name
-       
-       # first we check to make sure each threadgroup_threadcounts is numeric
-       for n in ${!threadgroup_threadcounts[@]} ; do
-           case ${threadgroup_threadcounts[$n]} in
-               ''|*[!0-9]*)
-                   echo "Error: Thread Group: ${threadgroup_names[$n]} has the value: ${threadgroup_threadcounts[$n]}, which is not numeric - Thread Count must be numeric!"
-                   echo
-                   echo "Script exiting..."
-                   echo
-                   exit;;
-                   *);;
-           esac
-       done
-       
-       # get count of thread groups, show results to screen
-       countofthreadgroups=${#threadgroup_threadcounts[@]}
-       echo "editing thread counts..."
-	echo
-	echo " - $project.jmx has $countofthreadgroups threadgroup(s) - [inc. those disabled]"
-	
-	# sum up the thread counts
-	sumofthreadgroups=0
-       for n in ${!threadgroup_threadcounts[@]} ; do
-		# populate an array of the original thread counts (used in the find and replace when editing the jmx)
-		orig_threadcounts[$n]=${threadgroup_threadcounts[$n]}
-		# create a total of the original thread counts
-		sumofthreadgroups=$(echo "$sumofthreadgroups+${threadgroup_threadcounts[$n]}" | bc)
-       done
-
-	# adjust each thread count based on percent
-	sumofadjthreadgroups=0
-	for n in "${!orig_threadcounts[@]}" ; do
-		# get a new thread count to 2 decimal places
-		float=$(echo "scale=2; ${orig_threadcounts[$n]}*($percent/100)" | bc)
-		# round to integer
-		new_threadcounts[$n]=$(echo "($float+0.5)/1" | bc)
-		if [ "${new_threadcounts[$n]}" -eq "0" ] ; then
-			echo " - Thread group ${threadgroup_names[$n]} has ${orig_threadcounts[$n]} threads, $percent percent of this is $float which rounds to 0, so we're going to set it to 1 instead."
-			new_threadcounts[$n]=1
-			sumofadjthreadgroups=$(echo "$sumofadjthreadgroups+1" | bc)
+   
+    if [ $ADJUST_THREADS == "true" ] ; then 
+	    # Create a working jmx file and edit it to adjust thread counts and filepaths (leave the original jmx intact!)
+	    cp $LOCAL_HOME/$project/jmx/$project.jmx $LOCAL_HOME/$project/working
+	    working_jmx="$LOCAL_HOME/$project/working"
+	    temp_jmx="$LOCAL_HOME/$project/temp"
+	    
+	    # first filepaths (this will help with things like csv files)
+	    # edit any 'stringProp filename=' references to use $REMOTE_DIR in place of whatever local path was being used
+	    # we assume that the required dat file is copied into the local /data directory
+	    filepaths=$(awk 'BEGIN { FS = ">" } ; /<stringProp name=\"filename\">[^<]*<\/stringProp>/ {print $2}' $working_jmx | cut -d'<' -f1) # pull out filepath
+	    i=1
+	    while read filepath ; do
+		if [ -n "$filepath" ] ; then # this entry is not blank
+		    # extract the filename from the filepath using '/' separator
+		    filename=$( echo $filepath | awk -F"/" '{print $NF}' )
+		    endresult="$REMOTE_HOME"/data/"$filename"
+		    if [[ $filepath =~ .*\$.* ]] ; then
+			echo "The path $filepath contains a $ char, this currently fails the awk sub command."
+			echo "You'll have to remove these from all filepaths. Sorry."
+			echo
+			echo "Script exiting"
+			exit
+		    fi
+		    awk '/<stringProp name=\"filename\">[^<]*<\/stringProp>/{c++;if(c=='"$i"') \
+					   {sub("filename\">'"$filepath"'<","filename\">'"$endresult"'<")}}1'  \
+					   $working_jmx > $temp_jmx
+		    rm $working_jmx
+		    mv $temp_jmx $working_jmx
 		fi
-	done
-	
-	# Now we sum up the thread counts and print a total
-	for n in ${!new_threadcounts[@]} ; do
-		sumofadjthreadgroups=$(echo "$sumofadjthreadgroups+${new_threadcounts[$n]}" | bc)
-	done
+		# increment i
+		i=$((i+1))
+	    done <<<"$filepaths"
+	    
+	    # now we use the same working file to edit thread counts
+	    # to cope with the problem of trying to spread 10 threads over 3 hosts (10/3 has a remainder) the script creates a unique jmx for each host
+	    # and then passes out threads to them on a round robin basis
+	    # as part of this we begin here by creating a working jmx file for each separate host using _$y to isolate
+	    for y in "${!hosts[@]}" ; do
+		# for each host create a working copy of the jmx file
+		cp "$working_jmx" "$working_jmx"_"$y"   
+	    done
+	    # loop through each threadgroup and then use a nested loop within that to edit the file for each host
+	       # pull out the current values for each thread group
+	       threadgroup_threadcounts=(`awk 'BEGIN { FS = ">" } ; /ThreadGroup\.num_threads\">[^<]*</ {print $2}' $working_jmx | cut -d'<' -f1`) # put the current thread counts into variable
+	       threadgroup_names=(`awk 'BEGIN { FS = "\"" } ; /ThreadGroup\" testname=\"[^\"]*\"/ {print $6}' $working_jmx`) # capture each thread group name
+	       
+	       # first we check to make sure each threadgroup_threadcounts is numeric
+	       for n in ${!threadgroup_threadcounts[@]} ; do
+		   case ${threadgroup_threadcounts[$n]} in
+		       ''|*[!0-9]*)
+			   echo "Error: Thread Group: ${threadgroup_names[$n]} has the value: ${threadgroup_threadcounts[$n]}, which is not numeric - Thread Count must be numeric!"
+			   echo
+			   echo "Script exiting..."
+			   echo
+			   exit;;
+			   *);;
+		   esac
+	       done
+	       
+	       # get count of thread groups, show results to screen
+	       countofthreadgroups=${#threadgroup_threadcounts[@]}
+	       echo "editing thread counts..."
+		echo
+		echo " - $project.jmx has $countofthreadgroups threadgroup(s) - [inc. those disabled]"
+		
+		# sum up the thread counts
+		sumofthreadgroups=0
+	       for n in ${!threadgroup_threadcounts[@]} ; do
+			# populate an array of the original thread counts (used in the find and replace when editing the jmx)
+			orig_threadcounts[$n]=${threadgroup_threadcounts[$n]}
+			# create a total of the original thread counts
+			sumofthreadgroups=$(echo "$sumofthreadgroups+${threadgroup_threadcounts[$n]}" | bc)
+	       done
 
-	echo " - There are $sumofthreadgroups threads in the test plan, this test is set to execute $percent percent of these, so will run using $sumofadjthreadgroups threads"
-
-	# now we loop through each thread group, editing a separate file for each host each iteration (nested loop)
-	for i in ${!threadgroup_threadcounts[@]} ; do
-		# using modulo we distribute the threads over all hosts, building the array 'threads'
-		# taking 10(threads)/3(hosts) as an example you would expect two hosts to be given 3 threads and one to be given 4.
-		for (( x=1; x<=${new_threadcounts[$i]}; x++ )); do
-			: $(( threads[$(( $x % ${#hosts[@]} ))]++ ))
+		# adjust each thread count based on percent
+		sumofadjthreadgroups=0
+		for n in "${!orig_threadcounts[@]}" ; do
+			# get a new thread count to 2 decimal places
+			float=$(echo "scale=2; ${orig_threadcounts[$n]}*($percent/100)" | bc)
+			# round to integer
+			new_threadcounts[$n]=$(echo "($float+0.5)/1" | bc)
+			if [ "${new_threadcounts[$n]}" -eq "0" ] ; then
+				echo " - Thread group ${threadgroup_names[$n]} has ${orig_threadcounts[$n]} threads, $percent percent of this is $float which rounds to 0, so we're going to set it to 1 instead."
+				new_threadcounts[$n]=1
+				sumofadjthreadgroups=$(echo "$sumofadjthreadgroups+1" | bc)
+			fi
+		done
+		
+		# Now we sum up the thread counts and print a total
+		for n in ${!new_threadcounts[@]} ; do
+			sumofadjthreadgroups=$(echo "$sumofadjthreadgroups+${new_threadcounts[$n]}" | bc)
 		done
 
-		# here we loop through every host, editing the jmx file and using a temp file to carry the changes over
-		for y in "${!hosts[@]}" ; do
-			# we're already in a loop for each thread group but awk will parse the entire file each time it is called so we need to
-			# use an index to know when to make the edit
-			# when c (awk's index) matches i (the main for loop's index) then a substitution is made
+		echo " - There are $sumofthreadgroups threads in the test plan, this test is set to execute $percent percent of these, so will run using $sumofadjthreadgroups threads"
 
-			# first check for any null values (caused by lots of hosts and not many threads)
-			threadgroupschanged=0
-			if [ -z "${threads[$y]}" ] ; then
-				threads[$y]=1
-				threadgroupschanged=$(echo "$threadgroupschanged+1" | bc)
-			fi
-			if [ "$threadgroupschanged" == "1" ] ; then
-				echo " - $threadgroupschanged thread groups were allocated zero threads, this happens because the total allocated threads to a group is less than the $instance_count instances being used."
-				echo "   To get around this the script gave each group an extra thread, a better solution is to revise the test configuration to use more threads / less instances"
-			fi
-			findstr="threads\">"${orig_threadcounts[$i]}
-			replacestr="threads\">"${threads[$y]}
-			awk -v "findthis=$findstr" -v "replacewiththis=$replacestr" \
-				'BEGIN{c=0} \
-				/ThreadGroup\.num_threads\">[^<]*</ \
-				{if(c=='"$i"'){sub(findthis,replacewiththis)};c++}1' \
-				"$working_jmx"_"$y" > "$temp_jmx"_"$y"
+		# now we loop through each thread group, editing a separate file for each host each iteration (nested loop)
+		for i in ${!threadgroup_threadcounts[@]} ; do
+			# using modulo we distribute the threads over all hosts, building the array 'threads'
+			# taking 10(threads)/3(hosts) as an example you would expect two hosts to be given 3 threads and one to be given 4.
+			for (( x=1; x<=${new_threadcounts[$i]}; x++ )); do
+				: $(( threads[$(( $x % ${#hosts[@]} ))]++ ))
+			done
 
-			# using awk requires the use of a temp file to save the results of the command, update the working file with this file
-			rm "$working_jmx"_"$y"
-			mv "$temp_jmx"_"$y" "$working_jmx"_"$y"
-		done
+			# here we loop through every host, editing the jmx file and using a temp file to carry the changes over
+			for y in "${!hosts[@]}" ; do
+				# we're already in a loop for each thread group but awk will parse the entire file each time it is called so we need to
+				# use an index to know when to make the edit
+				# when c (awk's index) matches i (the main for loop's index) then a substitution is made
+
+				# first check for any null values (caused by lots of hosts and not many threads)
+				threadgroupschanged=0
+				if [ -z "${threads[$y]}" ] ; then
+					threads[$y]=1
+					threadgroupschanged=$(echo "$threadgroupschanged+1" | bc)
+				fi
+				if [ "$threadgroupschanged" == "1" ] ; then
+					echo " - $threadgroupschanged thread groups were allocated zero threads, this happens because the total allocated threads to a group is less than the $instance_count instances being used."
+					echo "   To get around this the script gave each group an extra thread, a better solution is to revise the test configuration to use more threads / less instances"
+				fi
+				findstr="threads\">"${orig_threadcounts[$i]}
+				replacestr="threads\">"${threads[$y]}
+				awk -v "findthis=$findstr" -v "replacewiththis=$replacestr" \
+					'BEGIN{c=0} \
+					/ThreadGroup\.num_threads\">[^<]*</ \
+					{if(c=='"$i"'){sub(findthis,replacewiththis)};c++}1' \
+					"$working_jmx"_"$y" > "$temp_jmx"_"$y"
+
+				# using awk requires the use of a temp file to save the results of the command, update the working file with this file
+				rm "$working_jmx"_"$y"
+				mv "$temp_jmx"_"$y" "$working_jmx"_"$y"
+			done
 
 		# write update to screen - removed 23/04/2012
 		# echo "...$i) ${threadgroup_names[$i]} has ${threadgroup_threadcounts[$i]} thread(s), to be distributed over $instance_count instance(s)"
 
-		unset threads
-	done
-	echo
-	echo "...thread counts updated"
-	echo
-    
-    # scp the test files onto each host
-    echo -n "copying test files to $instance_count server(s)..."
-    
-    # scp jmx dir
-    echo -n "jmx files.."
-    for y in "${!hosts[@]}" ; do
-        (scp -q -C -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -r \
-                                      -i $PEM_PATH/$PEM_FILE \
-                                      $LOCAL_HOME/$project/working_$y \
-                                      $USER@${hosts[$y]}:$REMOTE_HOME/execute.jmx) &
-    done
-    wait
-    echo -n "done...."
-    
+			unset threads
+		done
+		echo
+		echo "...thread counts updated"
+		echo
+	    # scp the test files onto each host
+	    echo -n "copying test files to $instance_count server(s)..."
+	    
+	    # scp jmx dir
+	    echo -n "jmx files.."
+	    for y in "${!hosts[@]}" ; do
+		(scp -q -C -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -r \
+					      -i $PEM_PATH/$PEM_FILE \
+					      $LOCAL_HOME/$project/working_$y \
+					      $USER@${hosts[$y]}:$REMOTE_HOME/execute.jmx) &
+	    done
+	    wait
+	    echo -n "done...."
+    else
+	#Did not adjust threads, so just copy over the unmodified jmx file to each host
+        # scp the test files onto each host
+        echo -n "copying test files to $instance_count server(s)..."
+    	    
+        # scp jmx dir
+        echo -n "jmx files (unmodified).."
+        for y in "${!hosts[@]}" ; do
+	    (scp -q -C -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -r \
+	    			      -i $PEM_PATH/$PEM_FILE \
+	    			      $LOCAL_HOME/$project/jmx/$project.jmx \
+	    			      $USER@${hosts[$y]}:$REMOTE_HOME/execute.jmx) &
+        done
+        wait
+        echo -n "done...."
+    fi #End Adjust Threads
+   
     # scp data dir
     if [ "$setup" = "TRUE" ] ; then
     	if [ -r $LOCAL_HOME/$project/data ] ; then # don't try to upload this optional dir if it is not present
@@ -631,7 +715,7 @@ function runsetup() {
     echo
 }
 
-function runtest() {
+function pollresults() {
     # sleep_interval - how often we poll the jmeter output for results
     # this value should be the same as the Generate Summary Results interval set in jmeter.properties
     # to be certain, we read the value in here and adjust the wait to match (this prevents lots of duplicates being written to the screen)
@@ -1021,8 +1105,8 @@ function control_c(){
 trap control_c SIGINT
 
 check_prereqs
-runsetup
-runtest
+setupandrun
+pollresults
 runcleanup
 
 
